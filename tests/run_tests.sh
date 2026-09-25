@@ -1,23 +1,53 @@
 #!/bin/sh
-# Differential correctness suites for hmerge. From the repo root:
-#   make && sh tests/run_tests.sh [package-dir]     (default: repo root)
-# Set STATA to your Stata executable if it is not Stata/MP in /Applications.
+# Run from the repository root. Optional argument selects another package dir.
+# Require fresh, complete logs: Stata batch exit status alone is insufficient.
+set -eu
 PROTO=${1:-.}
 STATA=${STATA:-/Applications/Stata/StataMP.app/Contents/MacOS/stata-mp}
 ROOT=$(pwd)
+case "$PROTO" in /*) ;; *) PROTO="$ROOT/$PROTO" ;; esac
 mkdir -p logs
-# a wrapper keeps the batch log name predictable (Stata names it after the
-# last argument otherwise)
-printf 'do tests/test_hmerge.do "%s"\n' "$PROTO" > tests/_run_main.do
-"$STATA" -b do tests/_run_main.do; mv _run_main.log logs/test_hmerge.log
-grep -E 'differential tests:' logs/test_hmerge.log
-grep -E '^FAIL' logs/test_hmerge.log
-printf 'do tests/test_fallbacks.do "%s"\n' "$PROTO" > tests/_run_fb.do
-"$STATA" -b do tests/_run_fb.do; mv _run_fb.log logs/test_fallbacks.log
-grep -E 'fallback tests:' logs/test_fallbacks.log | tail -1
-cd tests/adversarial
-for f in adv1 adv2 adv3; do
-  printf 'global HM_DIR "%s/%s"\ndo %s.do\n' "$ROOT" "$PROTO" "$f" > _run_$f.do
-  "$STATA" -b do _run_$f.do
-  echo "adversarial $f: holds=$(grep -c '^HOLDS' _run_$f.log) differs=$(grep -c '^BUG?' _run_$f.log) $(grep '^BUG?' _run_$f.log | tr '\n' ' ')"
+
+for suite in main fb adaptive; do
+    case "$suite" in
+        main) source=test_hmerge; expected='hmerge differential tests: 137 passed, 0 failed' ;;
+        fb) source=test_fallbacks; expected='fallback tests: 10 passed, 0 failed' ;;
+        adaptive) source=test_adaptive; expected='adaptive tests: 22 passed' ;;
+    esac
+    wrapper="tests/_run_${suite}.do"
+    batchlog="_run_${suite}.log"
+    result="logs/${source}.log"
+    rm -f "$batchlog" "$result"
+    printf 'do tests/%s.do "%s"\n' "$source" "$PROTO" > "$wrapper"
+    "$STATA" -b do "$wrapper"
+    test -f "$batchlog"
+    mv "$batchlog" "$result"
+    if ! grep -Fx "$expected" "$result"; then
+        tail -30 "$result"
+        exit 1
+    fi
+    if grep -E '^FAIL|^r\([0-9]+\);' "$result"; then exit 1; fi
 done
+
+cd tests/adversarial
+for suite in adv1 adv2 adv3; do
+    rm -f "_run_${suite}.log"
+    printf 'global HM_DIR "%s"\ndo %s.do\n' "$PROTO" "$suite" > "_run_${suite}.do"
+    "$STATA" -b do "_run_${suite}.do"
+    result="_run_${suite}.log"
+    test -f "$result"
+    holds=$(grep -c '^HOLDS' "$result" || true)
+    differs=$(grep -c '^BUG?' "$result" || true)
+    case "$suite" in
+        adv1)
+            test "$holds" -eq 17
+            test "$differs" -eq 1
+            grep -Eq '^BUG\? p13_gen_and_nogen[[:space:]]*$' "$result"
+            grep -q '^ADV1 suspected:' "$result" ;;
+        adv2) test "$holds" -eq 22; test "$differs" -eq 0; grep -q '^ADV2 suspected:' "$result" ;;
+        adv3) test "$holds" -eq 4; test "$differs" -eq 0; grep -q '^ADV3 suspected:' "$result" ;;
+    esac
+    if grep -E '^r\([0-9]+\);' "$result"; then exit 1; fi
+    echo "adversarial $suite: holds=$holds differs=$differs"
+done
+echo 'All suites completed; the sole allowed discrepancy is generate()+nogenerate.'

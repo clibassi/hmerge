@@ -16,7 +16,8 @@ set varabbrev off
 set linesize 255
 args proto
 if ( "`proto'" == "" ) local proto .
-local protodir "`c(pwd)'/`proto'"
+local protodir "`proto'"
+if substr("`proto'", 1, 1) != "/" local protodir "`c(pwd)'/`proto'"
 adopath ++ "`protodir'"
 
 global FB_PASS 0

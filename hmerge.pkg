@@ -1,13 +1,13 @@
 v 3
-d hmerge. Merge m:1 and 1:1 with a hash table instead of sorting (prototype)
+d hmerge. Merge m:1 and 1:1 without sorting the master (prototype)
 d
 d Same syntax and results as merge for m:1 and 1:1 merges, but the master data
-d are never sorted: the using keys are indexed and each master observation is
-d looked up where it sits. Compiled plugin provided for Apple silicon Macs only;
+d are never sorted: matching uses ordered, direct-address, or hash joins.
+d Compiled plugin provided for Apple silicon Macs only;
 d on other platforms hmerge notes this and calls merge.
 d
 d Author: CJ Libassi
-d Distribution-Date: 20260924
+d Distribution-Date: 20260925
 f hmerge.ado
 f hmerge.sthlp
 G MACARM64 hmerge_macarm64.plugin hmerge.plugin

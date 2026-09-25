@@ -1,4 +1,4 @@
-*! version 0.2.3  24sep2026  CJ Libassi
+*! version 0.3.0  25sep2026  CJ Libassi
 *! hmerge: merge m:1 and 1:1 without sorting the master data (prototype)
 *! https://github.com/clibassi/hmerge -- written with help from Claude (Anthropic)
 program hmerge, rclass
@@ -9,7 +9,7 @@ program hmerge, rclass
     *    hmerge is never less capable than merge.
     * ---------------------------------------------------------------------
     local cmdline `"`0'"'
-    * r(path) records what the call did: "direct" or "hash" (plugin join) or
+    * r(path) records what the call did: "direct", "ordered", or "hash" (plugin join) or
     * "native: <reason>" (handed to merge). The test suite checks it.
     gettoken mtype rest : 0, parse(" ,")
     gettoken first : rest, parse(" ,")
@@ -88,6 +88,12 @@ program hmerge, rclass
 
     _hm_results keepcodes : `"`keep'"'
     _hm_results assertcodes : `"`assert'"'
+
+    * Counts suffice for assert() and reporting. Only keep() needs per-row
+    * result codes when the user did not request a merge-result variable.
+    local writecodes = !`mergevaristemp' | ("`keepcodes'" != "")
+    local pluginmergevar `mergevar'
+    if ( !`writecodes' ) local pluginmergevar
 
     if ( regexm(`"`using'"', "^(http|https|ftp)://") ) {
         display as text "(hmerge: a using file on the web; using merge instead)"
@@ -287,8 +293,10 @@ program hmerge, rclass
         if ( "`newvars'" != "" ) {
             mata: (void) st_addvar(tokens(st_local("newtypes")), tokens(st_local("newvars")), 1)
         }
-        mata: (void) st_addvar("byte", st_local("mergevar"), 1)
-        plugin call hmerge_plugin `keys' `payload' `mergevar', ///
+        if ( `writecodes' ) {
+            mata: (void) st_addvar("byte", st_local("mergevar"), 1)
+        }
+        plugin call hmerge_plugin `keys' `payload' `pluginmergevar', ///
             write `token' `kk' `kp' `keyw' `payw' `mask'
         if ( `prof' ) {
             timer off 83
@@ -301,9 +309,9 @@ program hmerge, rclass
         local appended 0
         if ( `n2' > 0 & `want2' ) {
             quietly set obs `=`N0' + `n2''   // houserule-ok: merge prints no obs-count note
-            * appended rows are in using-file order: any sort flag is now false
+            * Appended rows follow key order, but the combined order need not.
             _hm_clear_sortedby
-            plugin call hmerge_plugin `keys' `payload' `mergevar', ///
+            plugin call hmerge_plugin `keys' `payload' `pluginmergevar', ///
                 append `token' `kk' `kp' `N0' `keyw' `payw'
             local appended `n2'
         }

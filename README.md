@@ -2,7 +2,8 @@
 
 `hmerge` is a prototype Stata command for `merge m:1` and `merge 1:1`. It takes the same
 syntax as `merge` and gives the same results, but it never sorts the master data. It
-indexes the using keys and looks up each master observation where it already sits.
+uses sequential matching when both inputs are ordered, or indexes the using keys
+and looks up each master observation where it already sits.
 
 ```stata
 net install hmerge, from("https://raw.githubusercontent.com/clibassi/hmerge/main/")
@@ -15,7 +16,11 @@ Stata/MP 17.
 
 ## When it is faster, and when it isn't
 
-Stata/MP 17.0 (2-core licence), MacBook Pro (Apple M5 Pro, 24 GB), 10 million master
+Version 0.3.0 adds an adaptive ordered join for physically ordered inputs, even when
+Stata's sort flag is empty. See [the ACS benchmark](bench/results/adaptive.md) for
+comparisons with native merge and 0.2.3, including shuffled and late-disorder cases.
+
+The original benchmarks below predate the ordered path and use Stata/MP 17.0 (2-core licence), MacBook Pro (Apple M5 Pro, 24 GB), 10 million master
 observations, one integer key, master in random order. Seconds, median of 3 runs with a
 warm file cache, end to end:
 
@@ -25,7 +30,7 @@ warm file cache, end to end:
 | 100,000 | 2.015 | 0.259 | 2.028 | 7.8x |
 | 5,000,000 | 2.299 | 1.204 | 3.370 | 1.9x |
 
-The gain comes from skipping the sort, so it depends on whether you need the sort:
+These gains depend on the workload and whether you need the result sorted:
 
 | case (J = 100,000) | merge | hmerge | ratio |
 |---|---|---|---|
@@ -61,9 +66,12 @@ make                      # builds hmerge.plugin (macOS, clang)
 sh tests/run_tests.sh     # set STATA=/path/to/stata if needed
 ```
 
-- **`tests/test_hmerge.do`** runs 135 cases against native `merge` on identical inputs. Every
+- **`tests/test_hmerge.do`** runs 137 cases against native `merge` on identical inputs. Every
   successful case must show that the plugin actually ran, via `r(path)`. A mutation check
   confirmed the suite fails when the ordering logic or the plugin detection is broken.
+- **`tests/test_adaptive.do`** adds 22 comparisons covering ordered keys, late master
+  inversions, uniqueness across the transition, empty inputs, missing and string keys,
+  filtering, and omitted merge-code writes.
 - **`tests/test_fallbacks.do`** covers argument errors and the hand-offs to `merge` (10 cases).
 - **`tests/adversarial/`** holds probes written by an independent reviewer. 43 of 44 match
   `merge` exactly. The exception is the error code when `generate()` and `nogenerate` are
@@ -75,13 +83,21 @@ sh tests/run_tests.sh     # set STATA=/path/to/stata if needed
 The using file is read into a temporary frame with Stata's own reader. The plugin then
 works in four steps:
 
-1. It copies the keys and payload into its own memory and builds a lookup table: a direct
-   lookup table for one integer key over a compact range, otherwise a hash table in which
-   every match is confirmed against the full key.
+1. It copies keys and payload into memory, checking physical key order as it reads.
+   One integer key over a compact range retains the direct lookup table. Otherwise,
+   ordered using keys select sequential matching; unordered using keys select hashing.
+   Hash matches are confirmed against the full key.
 2. A match step reads the master keys and writes nothing, so all validation errors leave the
-   data untouched.
-3. A write step fills the new variables and `_merge`.
-4. An append step adds the using-only observations.
+   data untouched. A descending master key triggers a hash-table build and continues
+   from that observation without replaying the prefix. Master order is preserved.
+   Unmatched master keys get a growing uniqueness set only when needed for `1:1`.
+3. A write step fills the new variables and `_merge`. With `nogenerate` and no `keep()`,
+   the temporary merge-code column is omitted; assertions and reports still use counts.
+4. An append step adds using-only observations in key order, skipping their sort when
+   using-key order was already verified.
+
+`r(path)` reports `direct`, `ordered`, or `hash`; an ordered join that switches to
+hashing reports `hash`. The sort flag is not used to choose the algorithm.
 
 Plugin memory persists between the calls. This works in current Stata but the Stata plugin
 interface doesn't document it, so every call is checked against a token and a mismatch stops

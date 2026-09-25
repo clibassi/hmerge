@@ -1,5 +1,5 @@
 {smcl}
-{* *! version 0.2.3  24sep2026}{...}
+{* *! version 0.3.0  25sep2026}{...}
 {vieweralsosee "[D] merge" "help merge"}{...}
 {vieweralsosee "[D] frames" "help frames"}{...}
 {viewerjumpto "Syntax" "hmerge##syntax"}{...}
@@ -52,9 +52,8 @@ and {cmd:1:1 _n} are passed to {helpb merge} unchanged; see
 on key variables, with the same syntax and results as {helpb merge} for many-to-one and
 one-to-one merges. It differs in how it matches. {cmd:merge} sorts the master data by
 the key variables and then joins the two sorted datasets. {cmd:hmerge} reads the using
-data into a temporary frame, builds a lookup table on the using keys (see
-{help hmerge##remarks:Remarks}), and looks up each master observation where it already
-is. The master data are never sorted.
+data into a temporary frame and chooses sequential matching or a lookup table
+(see {help hmerge##remarks:Remarks}), keeping each master observation where it is. The master data are never sorted.
 
 {pstd}
 Skipping the sort makes {cmd:hmerge} several times faster than {cmd:merge} on large,
@@ -85,8 +84,8 @@ advantage, and with a large using dataset or a 1:1 merge {cmd:merge} is faster.
 
 {phang}
 {opt sorted} is accepted so that {cmd:merge} commands can be changed to {cmd:hmerge}
-without editing their options. It has no effect, because {cmd:hmerge} does not sort
-either dataset, and {cmd:hmerge} does not check whether the data are sorted.
+without editing their options. It does not enforce sorted inputs. The plugin
+automatically checks physical key order while reading keys, regardless of this option.
 
 
 {marker differences}{...}
@@ -143,7 +142,11 @@ is correct after either command, or specify {opt sort}.
 {cmd:.a}, ..., {cmd:.z}) and empty strings are keys like any other, as in {cmd:merge}. When
 there is a single numeric key and the using values are integers over a compact range,
 the lookup table is a direct lookup table: an array indexed by key value minus the
-smallest key. Otherwise it is a hash table with open addressing. In a hash table a match
+smallest key. Otherwise, if the using keys are ordered, matching begins as a
+sequential join. The first descending master key builds a hash table and continues
+from that observation, preserving prior matches. Unordered using keys select a
+hash table immediately. Order is checked while reading keys, not through a separate
+scan or the dataset sort flag. In a hash table a match
 is always confirmed by comparing the full key values, so hash collisions cannot produce
 wrong matches.
 
@@ -181,8 +184,8 @@ than {cmd:merge}; with a very large one it can need more.
 
 {synoptset 15 tabbed}{...}
 {p2col 5 15 19 2: Macros}{p_end}
-{synopt:{cmd:r(path)}}{cmd:direct} or {cmd:hash} when the plugin joined the data (the
-kind of lookup table used), or {cmd:native:} followed by the reason when the job was
+{synopt:{cmd:r(path)}}{cmd:direct}, {cmd:hash}, or {cmd:ordered} when the plugin joined the data
+(the final matching method; an ordered join that switches to hashing reports {cmd:hash}), or {cmd:native:} followed by the reason when the job was
 handed to {cmd:merge}{p_end}
 {p2colreset}{...}
 

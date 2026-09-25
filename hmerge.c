@@ -1,5 +1,5 @@
 /*
- * hmerge.c -- hash-join plugin behind hmerge.ado (stata-grouplab prototype).
+ * hmerge.c -- adaptive-join plugin behind hmerge.ado (stata-grouplab prototype).
  *
  * Why this exists: native -merge- sorts the master (O(N log N)) and, unless the
  * using file's stored sort flag matches, loads/sorts/re-saves the using file,
@@ -9,6 +9,10 @@
  * keys whose using values are integers in a compact range use a direct-
  * address table instead of the hash table (no hashing, one memory access).
  *
+ * Ordered using keys are detected while loading. Except on the compact integer
+ * direct-address path, ordered data use a sequential join. A master inversion
+ * builds the hash table lazily and continues without replaying the prefix.
+ *
  * Protocol (argv[0] selects the step; the ado drives the sequence):
  *
  *   build  <token> <kkeys> <kpay> <uniq> <w_1..w_kkeys> <pw_1..pw_kpay>
@@ -16,7 +20,7 @@
  *          w_k  = 0 for a numeric key, else the common str width used by BOTH
  *                 sides (the ado passes max(master width, using width)).
  *          pw_p = 0 for a numeric payload, else its str width.
- *          Copies keys+payload into plugin memory and builds the hash table.
+ *          Copies keys+payload, checks order, and selects ordered/direct/hash matching.
  *          If <uniq>==1, a duplicate using key is an error (m:1 / 1:1).
  *
  *   match  <token> <kkeys> <kpay> <uniqmaster> <w_1..> <pw_1..>
@@ -27,8 +31,8 @@
  *
  *   write  <token> <kkeys> <kpay> <w_1..> <pw_1..> <mask_1..>
  *          varlist = master keys, the kpay master TARGET vars (pre-created by
- *          the ado without filling), then the _merge var. Writes payload and
- *          _merge (1 or 3). Targets with mask 0 are pre-existing master vars
+ *          the ado without filling), then an optional _merge var. Writes payload and,
+ *          when supplied, _merge (1 or 3). Targets with mask 0 are pre-existing master vars
  *          (master values win for matched rows) and are skipped; targets with
  *          mask 1 get missing / "" in unmatched rows.
  *
@@ -36,7 +40,7 @@
  *          After the ado has run -set obs n0 + nusingonly-, writes the
  *          using-only rows (in key order, as merge does) into obs n0+1.. : keys,
  *          ALL payload vars (overlapping master vars included, as -merge-
- *          does), and _merge = 2.
+ *          does), and _merge = 2 when that variable is supplied.
  *
  *   free   releases the saved state.
  *
@@ -90,6 +94,9 @@ typedef struct {
     /* Direct-address path (single numeric key, all using keys integers in a
      * compact range): dtab[key - dmin] = using row + 1, 0 = absent. No
      * hashing and one memory access per lookup. */
+    int       uniq_using;   /* validation contract retained for deferred hashing */
+    int       using_sorted; /* physical key order, established while reading */
+    int       ordered;      /* sequential matcher until master order breaks */
     int       direct;
     double    dmin, dmax;
     uint32_t *dtab;
@@ -188,6 +195,29 @@ static ST_retcode hm_read_key(ST_int obs, int kkeys, const int *keyw,
     return 0;
 }
 
+static int hm_compare_keys(const unsigned char *ra, const unsigned char *rb)
+{
+    int k, c;
+    double za, zb;
+    for (k = 0; k < S->kkeys; k++) {
+        if (S->keyw[k] == 0) {
+            memcpy(&za, ra + S->keyoff[k], sizeof za);
+            memcpy(&zb, rb + S->keyoff[k], sizeof zb);
+            if (za < zb) return -1;
+            if (za > zb) return 1;
+            if (za != za || zb != zb) {          /* NaN: sort after numbers */
+                if (za == za) return -1;
+                if (zb == zb) return 1;
+            }
+        }
+        else {
+            c = memcmp(ra + S->keyoff[k], rb + S->keyoff[k], (size_t) S->keyw[k]);
+            if (c) return c < 0 ? -1 : 1;
+        }
+    }
+    return 0;
+}
+
 /* Find using row for a packed key, or -1. */
 static inline int64_t hm_lookup(const unsigned char *row)
 {
@@ -257,6 +287,35 @@ static int hm_check_layout(int kkeys, int kpay, char *argv[], int first)
 /* build                                                                    */
 /* ------------------------------------------------------------------------ */
 
+/* Build on demand if the using keys or the master are not ordered. */
+static ST_retcode hm_build_hash(int uniq)
+{
+    int64_t j;
+    S->slots = calloc((size_t) S->capacity, sizeof *S->slots);
+    if (S->slots == NULL) return HM_RC_OOM;
+    for (j = 0; j < S->J; j++) {
+        const unsigned char *row = S->keys + (size_t) j * S->keybytes;
+        uint64_t h = hm_hash(row, S->keybytes), mask = S->capacity - 1, i = h & mask;
+        uint32_t tag = (uint32_t) (h >> 32);
+        for (;;) {
+            uint64_t e = S->slots[i];
+            if (e == 0) {
+                S->slots[i] = ((uint64_t) tag << 32) | (uint64_t) (j + 1);
+                break;
+            }
+            if ((uint32_t) (e >> 32) == tag &&
+                memcmp(S->keys + (size_t) ((uint32_t) e - 1) * S->keybytes, row, S->keybytes) == 0) {
+                if (uniq) {
+                    return HM_RC_NOTUNIQ;
+                }
+                break;   /* first row wins */
+            }
+            i = (i + 1) & mask;
+        }
+    }
+    return 0;
+}
+
 static ST_retcode hm_build(int argc, char *argv[])
 {
     long long kkeys, kpay, uniq, v;
@@ -323,12 +382,19 @@ static ST_retcode hm_build(int argc, char *argv[])
     sbuf         = malloc((size_t) maxw + 2);
     if (!S->keys || !S->pay || !S->matched || !sbuf) { rc = HM_RC_OOM; goto fail; }
 
-    /* Pass 1: copy keys and payload out of Stata. */
+    S->uniq_using = (int) uniq;
+    S->using_sorted = 1;
+    /* Pass 1: copy keys and payload out of Stata; establish physical order. */
     for (j = 0; j < J; j++) {
         unsigned char *row = S->keys + (size_t) j * S->keybytes;
         unsigned char *prow = S->pay + (size_t) j * S->paybytes;
         if ((rc = hm_read_key((ST_int) (j + 1), S->kkeys, S->keyw, S->keyoff,
                               S->keybytes, row, sbuf))) goto fail;
+        if (j > 0 && S->using_sorted) {
+            int cmp = hm_compare_keys(row - S->keybytes, row);
+            if (cmp == 0 && uniq) { rc = HM_RC_NOTUNIQ; goto fail; }
+            if (cmp > 0) S->using_sorted = 0;
+        }
         for (k = 0; k < S->kpay; k++) {
             if (S->payw[k] == 0) {
                 if ((rc = SF_vdata(S->kkeys + k + 1, (ST_int) (j + 1), &z))) goto fail;
@@ -381,31 +447,11 @@ static ST_retcode hm_build(int argc, char *argv[])
         }
     }
 
-    if (!S->direct) {
-        S->slots = calloc((size_t) S->capacity, sizeof *S->slots);
-        if (S->slots == NULL) { rc = HM_RC_OOM; goto fail; }
-        for (j = 0; j < J; j++) {
-            const unsigned char *row = S->keys + (size_t) j * S->keybytes;
-            uint64_t h = hm_hash(row, S->keybytes), mask = S->capacity - 1, i = h & mask;
-            uint32_t tag = (uint32_t) (h >> 32);
-            for (;;) {
-                uint64_t e = S->slots[i];
-                if (e == 0) {
-                    S->slots[i] = ((uint64_t) tag << 32) | (uint64_t) (j + 1);
-                    break;
-                }
-                if ((uint32_t) (e >> 32) == tag &&
-                    memcmp(S->keys + (size_t) ((uint32_t) e - 1) * S->keybytes, row, S->keybytes) == 0) {
-                    if (uniq) {
-                        rc = HM_RC_NOTUNIQ; goto fail;
-                    }
-                    break;   /* first row wins */
-                }
-                i = (i + 1) & mask;
-            }
-        }
+    S->ordered = S->using_sorted && !S->direct;
+    if (!S->direct && !S->ordered) {
+        if ((rc = hm_build_hash((int) uniq))) goto fail;
     }
-    SF_macro_save("_hm_index", S->direct ? "direct" : "hash");
+    SF_macro_save("_hm_index", S->direct ? "direct" : (S->ordered ? "ordered" : "hash"));
     free(sbuf);
     return 0;
 
@@ -442,6 +488,52 @@ static ST_retcode hm_write_payload(ST_int obs, int64_t r, int tgt0,
     return 0;
 }
 
+/* Only unmatched master keys need a separate uniqueness set: matched keys
+ * are checked with S->matched. Allocate lazily, growing at half occupancy. */
+static ST_retcode hm_unmatched_insert(const unsigned char *row,
+                                      uint64_t **slots, unsigned char **keys,
+                                      uint64_t *capacity, uint64_t *used)
+{
+    uint64_t h, i, mask, e;
+    uint32_t tag;
+    if (*used >= *capacity / 2) {
+        uint64_t next = *capacity ? *capacity * 2 : 16;
+        uint64_t *newslots;
+        unsigned char *newkeys;
+        if (next < *capacity || next > SIZE_MAX / sizeof **slots ||
+            next / 2 > SIZE_MAX / S->keybytes) return HM_RC_OOM;
+        newslots = calloc((size_t) next, sizeof *newslots);
+        newkeys = malloc((size_t) (next / 2) * S->keybytes);
+        if (!newslots || !newkeys) {
+            free(newslots); free(newkeys);
+            return HM_RC_OOM;
+        }
+        if (*used) memcpy(newkeys, *keys, (size_t) *used * S->keybytes);
+        for (uint64_t r = 0; r < *used; r++) {
+            h = hm_hash(newkeys + (size_t) r * S->keybytes, S->keybytes);
+            i = h & (next - 1);
+            while (newslots[i]) i = (i + 1) & (next - 1);
+            newslots[i] = (h & UINT64_C(0xffffffff00000000)) | (r + 1);
+        }
+        free(*slots); free(*keys);
+        *slots = newslots; *keys = newkeys; *capacity = next;
+    }
+    h = hm_hash(row, S->keybytes);
+    mask = *capacity - 1;
+    i = h & mask;
+    tag = (uint32_t) (h >> 32);
+    while ((e = (*slots)[i]) != 0) {
+        if ((uint32_t) (e >> 32) == tag &&
+            memcmp(*keys + (size_t) ((uint32_t) e - 1) * S->keybytes,
+                   row, S->keybytes) == 0) return HM_RC_NOTUNIQ;
+        i = (i + 1) & mask;
+    }
+    if (*used >= UINT32_MAX - 1) return HM_RC_OOM;
+    memcpy(*keys + (size_t) *used * S->keybytes, row, S->keybytes);
+    (*slots)[i] = ((uint64_t) tag << 32) | ++*used;
+    return 0;
+}
+
 static ST_retcode hm_match(int argc, char *argv[])
 {
     /* match <token> <kkeys> <kpay> <uniqmaster> <w..> <pw..>
@@ -452,12 +544,13 @@ static ST_retcode hm_match(int argc, char *argv[])
     int k, maxw = 0;
     ST_retcode rc = 0;
     ST_int obs, N = SF_nobs();
-    unsigned char *row = NULL;
+    unsigned char *row = NULL, *previous = NULL;
+    int64_t cursor = 0;
     char *sbuf = NULL, buf[64];
     int64_t n1 = 0, n3 = 0, r;
     uint64_t mcap = 0, *mslots = NULL;   /* 1:1 only: set of unmatched master keys */
     unsigned char *mkeys = NULL;
-    int64_t mused = 0;
+    uint64_t mused = 0;
 
     if (argc < 5) return HM_RC_SYNTAX;
     if ((rc = hm_check_token(argv[1]))) return rc;
@@ -472,21 +565,29 @@ static ST_retcode hm_match(int argc, char *argv[])
     free(S->mmatch);
     S->mmatch = malloc((size_t) (N > 0 ? N : 1) * sizeof *S->mmatch);
     row  = malloc(S->keybytes);
+    if (S->ordered) previous = malloc(S->keybytes);
     sbuf = malloc((size_t) maxw + 2);
-    if (!S->mmatch || !row || !sbuf) { rc = HM_RC_OOM; goto done; }
+    if (!S->mmatch || !row || !sbuf || (S->ordered && !previous)) { rc = HM_RC_OOM; goto done; }
     memset(S->matched, 0, (size_t) (S->J ? S->J : 1));
-    if (uniqmaster) {
-        mcap = 16;
-        while (mcap < (uint64_t) (2 * (N > 0 ? N : 1))) mcap <<= 1;
-        mslots = calloc((size_t) mcap, sizeof *mslots);
-        mkeys  = malloc((size_t) (N > 0 ? N : 1) * S->keybytes);
-        if (!mslots || !mkeys) { rc = HM_RC_OOM; goto done; }
-    }
 
     for (obs = 1; obs <= N; obs++) {
         if ((rc = hm_read_key(obs, S->kkeys, S->keyw, S->keyoff, S->keybytes, row, sbuf)))
             goto done;
-        r = hm_lookup(row);
+        if (S->ordered && obs > 1 && hm_compare_keys(previous, row) > 0) {
+            if ((rc = hm_build_hash(S->uniq_using))) goto done;
+            S->ordered = 0;
+        }
+        if (S->ordered) {
+            int cmp = -1;
+            while (cursor < S->J) {
+                cmp = hm_compare_keys(S->keys + (size_t) cursor * S->keybytes, row);
+                if (cmp >= 0) break;
+                cursor++;
+            }
+            r = (cursor < S->J && cmp == 0) ? cursor : -1;
+            memcpy(previous, row, S->keybytes);
+        }
+        else r = hm_lookup(row);
         if (r >= 0) {
             if (uniqmaster && S->matched[r]) {
                 rc = HM_RC_NOTUNIQ; goto done;
@@ -497,27 +598,14 @@ static ST_retcode hm_match(int argc, char *argv[])
         }
         else {
             if (uniqmaster) {
-                /* unmatched master keys must also be unique under 1:1 */
-                uint64_t h = hm_hash(row, S->keybytes), m = mcap - 1, i = h & m;
-                uint32_t tag = (uint32_t) (h >> 32);
-                for (;;) {
-                    uint64_t e = mslots[i];
-                    if (e == 0) {
-                        memcpy(mkeys + (size_t) mused * S->keybytes, row, S->keybytes);
-                        mslots[i] = ((uint64_t) tag << 32) | (uint64_t) (++mused);
-                        break;
-                    }
-                    if ((uint32_t) (e >> 32) == tag &&
-                        memcmp(mkeys + (size_t) ((uint32_t) e - 1) * S->keybytes, row, S->keybytes) == 0) {
-                        rc = HM_RC_NOTUNIQ; goto done;
-                    }
-                    i = (i + 1) & m;
-                }
+                rc = hm_unmatched_insert(row, &mslots, &mkeys, &mcap, &mused);
+                if (rc) goto done;
             }
             S->mmatch[obs - 1] = 0;
             n1++;
         }
     }
+    SF_macro_save("_hm_index", S->direct ? "direct" : (S->ordered ? "ordered" : "hash"));
     S->nmaster = N;
     S->nusingonly = 0;
     for (r = 0; r < S->J; r++) S->nusingonly += !S->matched[r];
@@ -530,7 +618,7 @@ static ST_retcode hm_match(int argc, char *argv[])
     SF_macro_save("_hm_n2", buf);
 
 done:
-    free(row); free(sbuf); free(mslots); free(mkeys);
+    free(row); free(previous); free(sbuf); free(mslots); free(mkeys);
     if (rc) { free(S->mmatch); S->mmatch = NULL; }
     return rc;
 }
@@ -553,7 +641,9 @@ static ST_retcode hm_write(int argc, char *argv[])
     if (hm_parse_int(argv[2], &kkeys) || hm_parse_int(argv[3], &kpay)) return HM_RC_SYNTAX;
     if (argc != 4 + kkeys + 2 * kpay) return HM_RC_SYNTAX;
     if ((rc = hm_check_layout((int) kkeys, (int) kpay, argv, 4))) return rc;
-    if (SF_nvars() != kkeys + kpay + 1) return HM_RC_SYNTAX;
+    if (SF_nvars() != kkeys + kpay && SF_nvars() != kkeys + kpay + 1)
+        return HM_RC_SYNTAX;
+    int writecodes = (SF_nvars() == kkeys + kpay + 1);
     if (S->mmatch == NULL || (int64_t) N != S->nmaster) return HM_RC_STATE;
 
     for (k = 0; k < S->kpay; k++) if (S->payw[k] > maxw) maxw = S->payw[k];
@@ -571,7 +661,7 @@ static ST_retcode hm_write(int argc, char *argv[])
         uint32_t m = S->mmatch[obs - 1];
         if (m) {
             if ((rc = hm_write_payload(obs, (int64_t) m - 1, S->kkeys, mask, sbuf))) goto done;
-            if ((rc = SF_vstore(S->kkeys + S->kpay + 1, obs, 3.0))) goto done;
+            if (writecodes && (rc = SF_vstore(S->kkeys + S->kpay + 1, obs, 3.0))) goto done;
         }
         else {
             /* New payload vars were created without filling (st_addvar
@@ -582,7 +672,7 @@ static ST_retcode hm_write(int argc, char *argv[])
                 else                 rc = SF_sstore(S->kkeys + k + 1, obs, "");
                 if (rc) goto done;
             }
-            if ((rc = SF_vstore(S->kkeys + S->kpay + 1, obs, 1.0))) goto done;
+            if (writecodes && (rc = SF_vstore(S->kkeys + S->kpay + 1, obs, 1.0))) goto done;
         }
     }
 
@@ -603,27 +693,8 @@ done:
  * there are no ties to break. */
 static int hm_keycmp(const void *a, const void *b)
 {
-    const unsigned char *ra = S->keys + (size_t) *(const int64_t *) a * S->keybytes;
-    const unsigned char *rb = S->keys + (size_t) *(const int64_t *) b * S->keybytes;
-    int k, c;
-    double za, zb;
-    for (k = 0; k < S->kkeys; k++) {
-        if (S->keyw[k] == 0) {
-            memcpy(&za, ra + S->keyoff[k], sizeof za);
-            memcpy(&zb, rb + S->keyoff[k], sizeof zb);
-            if (za < zb) return -1;
-            if (za > zb) return 1;
-            if (za != za || zb != zb) {          /* NaN: sort after numbers */
-                if (za == za) return -1;
-                if (zb == zb) return 1;
-            }
-        }
-        else {
-            c = memcmp(ra + S->keyoff[k], rb + S->keyoff[k], (size_t) S->keyw[k]);
-            if (c) return c < 0 ? -1 : 1;
-        }
-    }
-    return 0;
+    return hm_compare_keys(S->keys + (size_t) *(const int64_t *) a * S->keybytes,
+                           S->keys + (size_t) *(const int64_t *) b * S->keybytes);
 }
 
 static ST_retcode hm_append(int argc, char *argv[])
@@ -642,7 +713,9 @@ static ST_retcode hm_append(int argc, char *argv[])
         hm_parse_int(argv[4], &n0) || n0 < 0 || n0 > INT32_MAX) return HM_RC_SYNTAX;
     if (argc != 5 + kkeys + kpay) return HM_RC_SYNTAX;
     if ((rc = hm_check_layout((int) kkeys, (int) kpay, argv, 5))) return rc;
-    if (SF_nvars() != kkeys + kpay + 1) return HM_RC_SYNTAX;
+    if (SF_nvars() != kkeys + kpay && SF_nvars() != kkeys + kpay + 1)
+        return HM_RC_SYNTAX;
+    int writecodes = (SF_nvars() == kkeys + kpay + 1);
     if ((int64_t) SF_nobs() != n0 + S->nusingonly) return HM_RC_SYNTAX;
     if (n0 + S->nusingonly > INT32_MAX) return HM_RC_SYNTAX;   /* ST_int observation index */
 
@@ -654,7 +727,7 @@ static ST_retcode hm_append(int argc, char *argv[])
     order = malloc((size_t) (S->nusingonly ? S->nusingonly : 1) * sizeof *order);
     if (order == NULL) { free(sbuf); return HM_RC_OOM; }
     for (r = 0; r < S->J; r++) if (!S->matched[r]) order[nord++] = r;
-    qsort(order, (size_t) nord, sizeof *order, hm_keycmp);
+    if (!S->using_sorted) qsort(order, (size_t) nord, sizeof *order, hm_keycmp);
 
     obs = (ST_int) n0;
     for (i = 0; i < nord; i++) {
@@ -674,7 +747,7 @@ static ST_retcode hm_append(int argc, char *argv[])
             }
         }
         if ((rc = hm_write_payload(obs, r, S->kkeys, NULL, sbuf))) goto done;
-        if ((rc = SF_vstore(S->kkeys + S->kpay + 1, obs, 2.0))) goto done;
+        if (writecodes && (rc = SF_vstore(S->kkeys + S->kpay + 1, obs, 2.0))) goto done;
     }
 
 done:

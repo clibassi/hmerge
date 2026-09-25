@@ -22,7 +22,9 @@ set linesize 255
 * optional argument: package directory (default: the repository root, .)
 args proto
 if ( "`proto'" == "" ) local proto .
-adopath ++ "`c(pwd)'/`proto'"
+local protodir "`proto'"
+if substr("`proto'", 1, 1) != "/" local protodir "`c(pwd)'/`proto'"
+adopath ++ "`protodir'"
 which hmerge
 
 global HM_PASS 0
@@ -60,7 +62,7 @@ program hm_case
     local path_hm "`r(path)'"
     * a successful call must have used the plugin join; a silent hand-off to
     * merge would make every comparison below pass trivially
-    if ( `rc_hm' == 0 & !inlist("`path_hm'", "direct", "hash") & !strpos("`name'", "fallback") ) {
+    if ( `rc_hm' == 0 & !inlist("`path_hm'", "direct", "hash", "ordered") & !strpos("`name'", "fallback") ) {
         display as error "FAIL `name': hmerge ran native merge instead of the plugin (`path_hm')"
         local ok 0
     }
