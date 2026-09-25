@@ -1,0 +1,8 @@
+*.log
+hmerge.plugin
+bench/data/
+*.dta
+.DS_Store
+tests/_run_*.do
+tests/adversarial/_run_*
+logs/
